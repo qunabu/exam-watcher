@@ -64,19 +64,32 @@ function keepAliveScript() {
   fire();
 }
 
-let lastSlot = null;     // de-dupe notifications across checks
+const HEARTBEAT_MS = (parseInt(process.env.HEARTBEAT_HOURS || '12', 10)) * 3600 * 1000;
+let lastState = null;       // JSON of { word: earliest practice dt|null }
+let lastHeartbeat = 0;
 let deadAlerted = false;
 
-async function checkSlots(page) {
-  const url = page.url();
-  if (url.includes('/login') || url.includes('/logged-out')) {
-    if (!deadAlerted) {
-      await notify('Exam watch: session expired',
-        'Re-seed storageState (seed-storagestate.py) and redeploy.', { tags: 'warning' });
-      deadAlerted = true;
-    }
-    return;
+const fmt = (dt) => dt ? dt.replace('T', ' ').slice(0, 16) : 'brak';   // "brak" = none
+
+// "Gdańsk: 2026-07-24 15:00 | Gdynia: brak"
+function summarize(byWord) {
+  return TARGET_WORDS.map((w) => {
+    const short = w.replace('PORD Gdańsk O/', '').replace('PORD ', '');
+    return `${short}: ${fmt(byWord[w])}`;
+  }).join('\n');
+}
+
+async function alertDead() {
+  if (!deadAlerted) {
+    await notify('Exam watch: session expired',
+      'Re-seed storageState (seed-storagestate.py) and update the Render secret.', { tags: 'warning' });
+    deadAlerted = true;
   }
+}
+
+async function checkSlots(page) {
+  if (page.url().includes('/login') || page.url().includes('/logged-out')) { await alertDead(); return; }
+
   const res = await page.evaluate(async ({ url, payload, targets }) => {
     try {
       const r = await fetch(url, {
@@ -84,43 +97,53 @@ async function checkSlots(page) {
         headers: { 'content-type': 'application/json', accept: 'application/json, text/plain, */*' },
         body: JSON.stringify(payload),
       });
-      if (r.status === 401 || r.status === 403) return { status: r.status };
       if (!r.ok) return { status: r.status };
       const data = await r.json();
-      let best = null;
+      const byWord = {};
+      for (const w of targets) byWord[w] = null;   // ensure every target present
       for (const w of data) {
         if (!targets.includes(w.wordName)) continue;
         for (const e of (w.examCollectionForDay || [])) {
           if (e.examType === 'Practice' && e.practiceDateTime) {
-            if (!best || e.practiceDateTime < best.dt) best = { dt: e.practiceDateTime, word: w.wordName };
+            if (!byWord[w.wordName] || e.practiceDateTime < byWord[w.wordName]) {
+              byWord[w.wordName] = e.practiceDateTime;
+            }
           }
         }
       }
-      return { status: 200, best };
+      return { status: 200, byWord };
     } catch (e) { return { status: 0, err: String(e) }; }
   }, { url: EXAMS_URL, payload: PAYLOAD, targets: TARGET_WORDS });
 
-  if (res.status === 401 || res.status === 403) {
-    if (!deadAlerted) {
-      await notify('Exam watch: session expired',
-        'Re-seed storageState and redeploy.', { tags: 'warning' });
-      deadAlerted = true;
-    }
-    return;
-  }
+  if (res.status === 401 || res.status === 403) { await alertDead(); return; }
   if (res.status !== 200) { log('slot check status', res.status, res.err || ''); return; }
 
   deadAlerted = false;
-  if (res.best) {
-    const key = `${res.best.word}|${res.best.dt}`;
-    if (key !== lastSlot) {
-      await notify('🚗 Practice exam slot available!', `${res.best.word} — ${res.best.dt}`);
-      lastSlot = key;
+  const { byWord } = res;
+  const stateKey = JSON.stringify(byWord);
+  const now = Date.now();
+  log('slots:', TARGET_WORDS.map((w) => `${w}=${fmt(byWord[w])}`).join(', '));
+
+  if (stateKey !== lastState) {
+    // did any city get an earlier (or first) practice slot than before?
+    let improved = false;
+    const prev = lastState ? JSON.parse(lastState) : {};
+    for (const w of TARGET_WORDS) {
+      const cur = byWord[w], old = prev[w];
+      if (cur && (!old || cur < old)) improved = true;
     }
-    log('slot:', res.best.word, res.best.dt);
-  } else {
-    log('no practice slot at target centres');
-    lastSlot = null;   // reset so a future slot re-alerts
+    const any = TARGET_WORDS.some((w) => byWord[w]);
+    await notify(
+      improved ? '🚗 Earlier practice slot!' : 'Exam slots updated',
+      summarize(byWord),
+      { priority: improved ? 'high' : 'default', tags: improved ? 'car' : 'calendar' }
+    );
+    lastState = stateKey;
+    lastHeartbeat = now;
+  } else if (HEARTBEAT_MS > 0 && now - lastHeartbeat >= HEARTBEAT_MS) {
+    // periodic snapshot so the app always shows a recent "current state"
+    await notify('Exam slots (status)', summarize(byWord), { priority: 'min', tags: 'calendar' });
+    lastHeartbeat = now;
   }
 }
 
