@@ -12,10 +12,14 @@
  * token (e.g. exp 23:23:33 -> 23:36:42) and the session sustains indefinitely.
  */
 const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
 
 const NTFY_BASE   = process.env.NTFY_BASE   || 'https://ntfy.sh';
 const NTFY_TOPIC  = process.env.NTFY_TOPIC  || '';
-const STORAGE     = process.env.STORAGE_STATE || '/etc/secrets/storageState.json';
+const STORAGE     = process.env.STORAGE_STATE || '/etc/secrets/storageState.json';   // uploaded seed (read-only)
+const DATA_DIR    = process.env.DATA_DIR || '/tmp';                                   // mount a persistent disk here
+const LIVE_STATE  = path.join(DATA_DIR, 'storageState.json');                         // rotated session, survives restarts
 const CHECK_MS    = (parseInt(process.env.CHECK_INTERVAL || '300', 10)) * 1000;
 const RESERVATION = 'https://info-kierowca.pl/reservation';
 const EXAMS_URL   = 'https://info-kierowca.pl/bknd/exam/api/v1/Schedules/user/MultipleCentersExams';
@@ -33,6 +37,31 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
           '(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+// Decode the JWT exp from a storageState file (0 if missing/unreadable).
+function stateExp(file) {
+  try {
+    const ss = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const tok = (ss.cookies || []).find((c) => c.name === '__Secure-PUDOJT')?.value;
+    if (!tok) return 0;
+    const p = tok.split('.')[1];
+    return JSON.parse(Buffer.from(p, 'base64url').toString()).exp || 0;
+  } catch { return 0; }
+}
+
+// Choose the session source with the NEWEST token: a freshly-uploaded seed
+// beats a stale disk copy; a live rotated disk copy beats an old seed.
+function pickStorage() {
+  const seed = stateExp(STORAGE), live = stateExp(LIVE_STATE);
+  if (live && live >= seed) { log('using persisted session (exp', live, ')'); return LIVE_STATE; }
+  log('using seed session (exp', seed, ')');
+  return STORAGE;
+}
+
+async function saveState(context) {
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); await context.storageState({ path: LIVE_STATE }); }
+  catch (e) { log('saveState ERR', e.message); }
+}
 
 async function notify(title, message, { tags = 'car', priority = 'high' } = {}) {
   if (!NTFY_TOPIC) { log('NTFY_TOPIC unset; would notify:', title, '-', message); return; }
@@ -153,7 +182,7 @@ async function main() {
     headless: true,
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
   });
-  const context = await browser.newContext({ storageState: STORAGE, userAgent: UA });
+  const context = await browser.newContext({ storageState: pickStorage(), userAgent: UA });
   await context.addInitScript(keepAliveScript);
   const page = await context.newPage();
 
@@ -171,9 +200,10 @@ async function main() {
     log('logged in OK:', page.url());
   }
 
-  // poll loop
+  // poll loop — persist the (rotated) session each cycle so restarts resume it
   for (;;) {
     await checkSlots(page).catch(e => log('check ERR', e.message));
+    await saveState(context);
     await page.waitForTimeout(CHECK_MS);
   }
 }
