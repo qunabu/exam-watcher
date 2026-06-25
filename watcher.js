@@ -63,14 +63,24 @@ async function saveState(context) {
   catch (e) { log('saveState ERR', e.message); }
 }
 
+// HTTP header values must be Latin1 — strip emoji/Polish from the Title
+// (emoji is conveyed via the Tags header; UTF-8 body carries the real text).
+const asciiHeader = (s) => String(s).replace(/[^\x20-\x7E]/g, '').trim();
+
 async function notify(title, message, { tags = 'car', priority = 'high' } = {}) {
   if (!NTFY_TOPIC) { log('NTFY_TOPIC unset; would notify:', title, '-', message); return; }
   try {
     await fetch(`${NTFY_BASE}/${NTFY_TOPIC}`, {
-      method: 'POST', body: message,
-      headers: { Title: title, Priority: priority, Tags: tags },
+      method: 'POST',
+      body: Buffer.from(message, 'utf8'),          // UTF-8 body (Polish chars OK)
+      headers: {
+        Title: asciiHeader(title) || 'Exam watch',
+        Priority: priority,
+        Tags: tags,
+        'Content-Type': 'text/plain; charset=utf-8',
+      },
     });
-    log('ntfy:', title, '-', message);
+    log('ntfy:', title, '-', message.replace(/\n/g, ' | '));
   } catch (e) { log('ntfy ERR', e.message); }
 }
 
@@ -163,7 +173,7 @@ async function checkSlots(page) {
     }
     const any = TARGET_WORDS.some((w) => byWord[w]);
     await notify(
-      improved ? '🚗 Earlier practice slot!' : 'Exam slots updated',
+      improved ? 'Earlier practice slot!' : 'Exam slots updated',
       summarize(byWord),
       { priority: improved ? 'high' : 'default', tags: improved ? 'car' : 'calendar' }
     );
