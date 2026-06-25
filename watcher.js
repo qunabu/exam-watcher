@@ -103,6 +103,12 @@ function keepAliveScript() {
   fire();
 }
 
+// Date scanning: the API only returns a limited window from startDate, so we
+// scan forward in steps until each city has a first slot (or we hit MAX_SCANS).
+const START_DATE     = process.env.START_DATE || new Date().toISOString().slice(0, 10); // default today
+const SCAN_STEP_DAYS = parseInt(process.env.SCAN_STEP_DAYS || '30', 10);
+const MAX_SCANS      = parseInt(process.env.MAX_SCANS || '8', 10);   // ~8 months ahead
+
 const HEARTBEAT_MS = (parseInt(process.env.HEARTBEAT_HOURS || '12', 10)) * 3600 * 1000;
 let lastState = null;       // JSON of { word: earliest practice dt|null }
 let lastHeartbeat = 0;
@@ -126,20 +132,19 @@ async function alertDead() {
   }
 }
 
-async function checkSlots(page) {
-  if (page.url().includes('/login') || page.url().includes('/logged-out')) { await alertDead(); return; }
-
-  const res = await page.evaluate(async ({ url, payload, targets }) => {
+// Query a single date window. Returns earliest Practice dt per target word.
+async function queryWindow(page, startDate) {
+  return page.evaluate(async ({ url, payload, targets, startDate }) => {
     try {
       const r = await fetch(url, {
         method: 'POST', credentials: 'include',
         headers: { 'content-type': 'application/json', accept: 'application/json, text/plain, */*' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ ...payload, startDate }),
       });
       if (!r.ok) return { status: r.status };
       const data = await r.json();
       const byWord = {};
-      for (const w of targets) byWord[w] = null;   // ensure every target present
+      for (const w of targets) byWord[w] = null;
       for (const w of data) {
         if (!targets.includes(w.wordName)) continue;
         for (const e of (w.examCollectionForDay || [])) {
@@ -152,13 +157,34 @@ async function checkSlots(page) {
       }
       return { status: 200, byWord };
     } catch (e) { return { status: 0, err: String(e) }; }
-  }, { url: EXAMS_URL, payload: PAYLOAD, targets: TARGET_WORDS });
+  }, { url: EXAMS_URL, payload: PAYLOAD, targets: TARGET_WORDS, startDate });
+}
 
-  if (res.status === 401 || res.status === 403) { await alertDead(); return; }
-  if (res.status !== 200) { log('slot check status', res.status, res.err || ''); return; }
+const addDays = (ymd, n) => {
+  const d = new Date(ymd + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+
+async function checkSlots(page) {
+  if (page.url().includes('/login') || page.url().includes('/logged-out')) { await alertDead(); return; }
+
+  // Scan forward window-by-window until every city has a first slot (or max scans).
+  const byWord = {};
+  for (const w of TARGET_WORDS) byWord[w] = null;
+  let startDate = START_DATE;
+  let queried = false;
+  for (let i = 0; i < MAX_SCANS; i++) {
+    if (TARGET_WORDS.every((w) => byWord[w])) break;     // all found
+    const res = await queryWindow(page, startDate);
+    if (res.status === 401 || res.status === 403) { await alertDead(); return; }
+    if (res.status !== 200) { log('scan status', res.status, res.err || '', 'at', startDate); break; }
+    queried = true;
+    for (const w of TARGET_WORDS) if (!byWord[w] && res.byWord[w]) byWord[w] = res.byWord[w];
+    startDate = addDays(startDate, SCAN_STEP_DAYS);
+  }
+  if (!queried) return;
 
   deadAlerted = false;
-  const { byWord } = res;
   const stateKey = JSON.stringify(byWord);
   const now = Date.now();
   log('slots:', TARGET_WORDS.map((w) => `${w}=${fmt(byWord[w])}`).join(', '));
@@ -186,39 +212,69 @@ async function checkSlots(page) {
   }
 }
 
-async function main() {
-  if (!NTFY_TOPIC) log('WARNING: NTFY_TOPIC not set — notifications disabled');
+const RECYCLE_MS = (parseInt(process.env.RECYCLE_HOURS || '3', 10)) * 3600 * 1000;
+
+// Cut memory/CPU: don't download images, fonts, media or 3rd-party junk.
+// Keep all info-kierowca scripts/XHR/documents so the SPA boots and refreshes.
+async function installResourceBlocking(context) {
+  await context.route('**/*', (route) => {
+    const req = route.request();
+    const type = req.resourceType();
+    const url = req.url();
+    if (['image', 'media', 'font'].includes(type)) return route.abort();
+    if (/google|gstatic|githubassets|msftauth|icon-icons|scorchsoft/.test(url)) return route.abort();
+    return route.continue();
+  });
+}
+
+// One browser lifetime: launch, run the poll loop, recycle after RECYCLE_MS.
+async function runOnce() {
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
+           '--disable-extensions', '--no-zygote', '--mute-audio'],
   });
-  const context = await browser.newContext({ storageState: pickStorage(), userAgent: UA });
-  await context.addInitScript(keepAliveScript);
-  const page = await context.newPage();
+  try {
+    const context = await browser.newContext({ storageState: pickStorage(), userAgent: UA });
+    await installResourceBlocking(context);
+    await context.addInitScript(keepAliveScript);
+    const page = await context.newPage();
 
-  log('navigating to reservation page…');
-  await page.goto(RESERVATION, { waitUntil: 'networkidle', timeout: 60000 }).catch(e => log('goto warn', e.message));
-  await page.waitForTimeout(3000);
+    log('navigating to reservation page…');
+    await page.goto(RESERVATION, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(e => log('goto warn', e.message));
+    await page.waitForTimeout(5000);   // let Angular boot + schedule its refresh
 
-  if (page.url().includes('/login') || page.url().includes('/logged-out')) {
-    await notify('Exam watch: not logged in',
-      'The seeded session was already invalid. Re-seed storageState and redeploy.', { tags: 'warning' });
-    log('FATAL: seeded session invalid (', page.url(), ')');
-  } else {
-    await notify('Exam watch started',
-      'Monitoring PORD Gdańsk / Gdynia for practice slots.', { tags: 'white_check_mark', priority: 'low' });
-    log('logged in OK:', page.url());
-  }
+    if (page.url().includes('/login') || page.url().includes('/logged-out')) {
+      await alertDead();
+      log('seeded session invalid (', page.url(), ')');
+    } else {
+      deadAlerted = false;
+      await saveState(context);
+      log('logged in OK:', page.url());
+    }
 
-  // poll loop — persist the (rotated) session each cycle so restarts resume it
-  for (;;) {
-    await checkSlots(page).catch(e => log('check ERR', e.message));
-    await saveState(context);
-    await page.waitForTimeout(CHECK_MS);
+    const startedAt = Date.now();
+    for (;;) {
+      await checkSlots(page);
+      await saveState(context);
+      if (Date.now() - startedAt > RECYCLE_MS) { log('recycling browser to bound memory'); return; }
+      await page.waitForTimeout(CHECK_MS);
+    }
+  } finally {
+    await browser.close().catch(() => {});
   }
 }
 
-main().catch(async (e) => {
-  console.error('fatal', e);
-  process.exit(1);   // Render restarts the worker
-});
+// Supervisor: keep the watcher alive forever; relaunch the browser on any crash.
+async function main() {
+  if (!NTFY_TOPIC) log('WARNING: NTFY_TOPIC not set — notifications disabled');
+  await notify('Exam watch started',
+    'Monitoring PORD Gdańsk / Gdynia for practice slots.', { tags: 'white_check_mark', priority: 'low' });
+  for (;;) {
+    try { await runOnce(); }
+    catch (e) { log('browser crashed, relaunching in 15s:', e.message); }
+    await new Promise((r) => setTimeout(r, 15000));
+  }
+}
+
+main();
