@@ -88,18 +88,29 @@ async function notify(title, message, { tags = 'car', priority = 'high' } = {}) 
 // the SPA's inactivity timer never fires (it lets the site refresh the token).
 function keepAliveScript() {
   if (window.__ka) return;
+  const norm = (s) => (s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/ł/g, 'l').replace(/Ł/g, 'L').toLowerCase();
+  // The decisive piece: auto-click "Przedłuż sesję" when the
+  // "Sesja wkrótce wygaśnie" dialog appears — extends the session server-side
+  // with NO re-login. (Same technique the gov-session keepalive extensions use.)
+  const clickExtend = () => {
+    const b = [...document.querySelectorAll('button,[role=button]')]
+      .find((x) => norm(x.textContent).includes('przedluz sesj') && !x.disabled);
+    if (b) { try { b.click(); console.log('[keepalive] clicked Przedluz sesje @ ' + new Date().toISOString()); return true; } catch (e) {} }
+    return false;
+  };
   let n = 0;
   const fire = () => {
     n++;
     const o = { bubbles: true, cancelable: true, view: window };
     document.dispatchEvent(new MouseEvent('mousemove', { ...o, clientX: 100 + (n % 50), clientY: 200 + (n % 30) }));
-    document.dispatchEvent(new MouseEvent('mousedown', o));
-    document.dispatchEvent(new MouseEvent('mouseup', o));
     document.dispatchEvent(new KeyboardEvent('keydown', { ...o, key: 'Shift' }));
     document.dispatchEvent(new Event('scroll', { bubbles: true }));
-    window.dispatchEvent(new MouseEvent('mousemove', o));
+    clickExtend();
   };
-  window.__ka = setInterval(fire, 60000);
+  try {                              // catch the dialog the instant it's inserted
+    new MutationObserver(() => clickExtend()).observe(document.documentElement, { childList: true, subtree: true });
+  } catch (e) {}
+  window.__ka = setInterval(fire, 30000);
   fire();
 }
 
@@ -277,6 +288,7 @@ async function runOnce() {
     await installResourceBlocking(context);
     await context.addInitScript(keepAliveScript);
     const page = await context.newPage();
+    page.on('console', (m) => { const t = m.text(); if (t.includes('[keepalive]')) log('PAGE', t); });
 
     log('navigating to reservation page…');
     await page.goto(RESERVATION, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(e => log('goto warn', e.message));
