@@ -1,0 +1,12 @@
+# Secrets / session — uploaded to Render as a secret file, NEVER committed.
+storageState.json
+cookies.jar
+cookies.json
+*.db
+state.json
+
+# Node
+node_modules/
+
+# scratch
+debug.js

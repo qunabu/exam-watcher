@@ -1,0 +1,13 @@
+{
+  "name": "exam-watcher",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless-browser watcher for info-kierowca.pl practice exam slots",
+  "main": "watcher.js",
+  "scripts": {
+    "start": "node watcher.js"
+  },
+  "dependencies": {
+    "playwright": "^1.49.1"
+  }
+}
