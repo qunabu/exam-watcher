@@ -144,16 +144,15 @@ async function attemptReauth(page) {
     await page.goto(RESERVATION, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
     await page.waitForTimeout(2500);
     if (!LOGGEDOUT(page.url())) return true;       // already back in
+    // Click the login.gov.pl method CARD (NOT the generic "Zaloguj się" button,
+    // which just reloads /login). This is what initiates the national-node SSO.
     const clicked = await page.evaluate(() => {
-      const els = [...document.querySelectorAll('a,button,[role=button]')];
-      const m = els.find((e) => {
-        const t = (e.textContent || '') + ' ' + (e.getAttribute('href') || '');
-        return /login\.gov\.pl|mObywatel|zaloguj|edo-login|profil zaufany/i.test(t);
-      });
-      if (m) { m.click(); return true; }
+      const els = [...document.querySelectorAll('mat-card,[class*=card],a,button,[role=button]')];
+      const m = els.find((e) => /login\.gov\.pl/i.test(e.textContent || '') && !/edo/i.test(e.textContent || ''));
+      if (m) { m.scrollIntoView(); m.click(); return true; }
       return false;
     });
-    if (!clicked) { log('re-auth: no login control found on page'); return false; }
+    if (!clicked) { log('re-auth: login.gov.pl card not found'); return false; }
     for (let i = 0; i < 8; i++) {                  // let the SSO redirect chain settle
       await page.waitForTimeout(2000);
       if (!LOGGEDOUT(page.url()) && /info-kierowca\.pl/.test(page.url())) return true;
