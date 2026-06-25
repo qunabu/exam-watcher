@@ -127,9 +127,48 @@ function summarize(byWord) {
 async function alertDead() {
   if (!deadAlerted) {
     await notify('Exam watch: session expired',
-      'Re-seed storageState (seed-storagestate.py) and update the Render secret.', { tags: 'warning' });
+      'Silent re-auth failed — re-seed storageState (seed-storagestate.py) and update the Render secret.',
+      { tags: 'warning' });
     deadAlerted = true;
   }
+}
+
+const LOGGEDOUT = (u) => /\/login|\/logged-out/.test(u);
+
+// Silent re-auth: if the identity-provider (login.gov.pl) session is still valid,
+// clicking the portal's login control round-trips through it and lands back
+// logged in — no 2FA. If it stalls on a gov-login/2FA screen, it can't, → false.
+async function attemptReauth(page) {
+  log('attempting silent re-auth via login.gov.pl…');
+  try {
+    await page.goto(RESERVATION, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+    await page.waitForTimeout(2500);
+    if (!LOGGEDOUT(page.url())) return true;       // already back in
+    const clicked = await page.evaluate(() => {
+      const els = [...document.querySelectorAll('a,button,[role=button]')];
+      const m = els.find((e) => {
+        const t = (e.textContent || '') + ' ' + (e.getAttribute('href') || '');
+        return /login\.gov\.pl|mObywatel|zaloguj|edo-login|profil zaufany/i.test(t);
+      });
+      if (m) { m.click(); return true; }
+      return false;
+    });
+    if (!clicked) { log('re-auth: no login control found on page'); return false; }
+    for (let i = 0; i < 8; i++) {                  // let the SSO redirect chain settle
+      await page.waitForTimeout(2000);
+      if (!LOGGEDOUT(page.url()) && /info-kierowca\.pl/.test(page.url())) return true;
+    }
+    log('re-auth: stalled at', page.url(), '(IdP session likely needs interactive 2FA)');
+    return false;
+  } catch (e) { log('re-auth error', e.message); return false; }
+}
+
+// Returns true if logged in (after a silent re-auth attempt if needed).
+async function ensureLoggedIn(page) {
+  if (!LOGGEDOUT(page.url())) return true;
+  if (await attemptReauth(page)) { log('silent re-auth OK:', page.url()); deadAlerted = false; return true; }
+  await alertDead();
+  return false;
 }
 
 // Query a single date window. Returns earliest Practice dt per target word.
@@ -166,7 +205,7 @@ const addDays = (ymd, n) => {
 };
 
 async function checkSlots(page) {
-  if (page.url().includes('/login') || page.url().includes('/logged-out')) { await alertDead(); return; }
+  if (!(await ensureLoggedIn(page))) return;   // attempts silent re-auth before giving up
 
   // Scan forward window-by-window until every city has a first slot (or max scans).
   const byWord = {};
@@ -244,13 +283,11 @@ async function runOnce() {
     await page.goto(RESERVATION, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(e => log('goto warn', e.message));
     await page.waitForTimeout(5000);   // let Angular boot + schedule its refresh
 
-    if (page.url().includes('/login') || page.url().includes('/logged-out')) {
-      await alertDead();
-      log('seeded session invalid (', page.url(), ')');
-    } else {
-      deadAlerted = false;
+    if (await ensureLoggedIn(page)) {
       await saveState(context);
       log('logged in OK:', page.url());
+    } else {
+      log('seeded session invalid and silent re-auth failed (', page.url(), ')');
     }
 
     const startedAt = Date.now();
