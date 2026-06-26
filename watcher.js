@@ -292,7 +292,13 @@ async function runOnce() {
     headless: true,
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
            '--disable-extensions', '--no-zygote', '--mute-audio',
-           '--disable-blink-features=AutomationControlled'],
+           '--disable-blink-features=AutomationControlled',
+           // Keep timers firing at full rate: headless renderers otherwise
+           // throttle/pause background timers, which silently kills the every-30s
+           // keepalive (and the "Przedłuż sesję" auto-click) → ~10-min logout.
+           '--disable-background-timer-throttling',
+           '--disable-backgrounding-occluded-windows',
+           '--disable-renderer-backgrounding'],
   });
   try {
     const context = await browser.newContext({ storageState: pickStorage(), userAgent: UA });
