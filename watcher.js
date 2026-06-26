@@ -289,7 +289,10 @@ async function installResourceBlocking(context) {
 // One browser lifetime: launch, run the poll loop, recycle after RECYCLE_MS.
 async function runOnce() {
   const browser = await chromium.launch({
-    headless: true,
+    // Headful under Xvfb (see Dockerfile): the site only renders/extends the
+    // "Sesja wkrótce wygaśnie" dialog and refreshes its token for a real,
+    // visible browser — headless silently hits the ~10-min inactivity logout.
+    headless: false,
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
            '--disable-extensions', '--no-zygote', '--mute-audio',
            '--disable-blink-features=AutomationControlled',
