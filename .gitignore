@@ -10,3 +10,8 @@ node_modules/
 
 # scratch
 debug.js
+
+# local render sync
+.render-key
+.run/
+chrome-extension-*.zip

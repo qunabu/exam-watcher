@@ -87,6 +87,16 @@ async function notify(title, message, { tags = 'car', priority = 'high' } = {}) 
 // Injected into the page on every navigation: dispatch activity every 60s so
 // the SPA's inactivity timer never fires (it lets the site refresh the token).
 function keepAliveScript() {
+  // Look like a normal browser, not automation: many sites skip the silent
+  // token refresh (or degrade the session) when they detect navigator.webdriver
+  // or a backgrounded/hidden page. Strip those signals so the headless session
+  // is renewed the same way a real Chrome tab is. Runs before page scripts.
+  try {
+    Object.defineProperty(navigator, 'webdriver', { configurable: true, get: () => false });
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+    document.hasFocus = () => true;
+  } catch (e) {}
   if (window.__ka) return;
   const norm = (s) => (s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/ł/g, 'l').replace(/Ł/g, 'L').toLowerCase();
   // The decisive piece: auto-click "Przedłuż sesję" when the
@@ -281,7 +291,8 @@ async function runOnce() {
   const browser = await chromium.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
-           '--disable-extensions', '--no-zygote', '--mute-audio'],
+           '--disable-extensions', '--no-zygote', '--mute-audio',
+           '--disable-blink-features=AutomationControlled'],
   });
   try {
     const context = await browser.newContext({ storageState: pickStorage(), userAgent: UA });
